@@ -9,6 +9,7 @@
 - 高番题按 7% 满贯、7% 跳满、3% 倍满、2% 三倍满、1% 累计役满抽取。
 - 允许超时后继续作答，并分别统计答案正确率与 5 秒内答对率。
 - 牌型、役种、宝牌和符数明细相互对应。
+- 使用统一规格的高清 PNG 牌图；暗手连续排列，所有鸣牌集中在最右侧。
 
 ## 环境
 
@@ -43,5 +44,7 @@ py -m py_compile .\mahjong_score_trainer.py
 
 ## 素材
 
-牌图素材及其许可证会记录在 `THIRD_PARTY_NOTICES.md`。项目代码与第三方素材分别遵循各自的权利声明。
+当前牌图来自 [FluffyStuff/riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)，按 CC0 1.0 / Public Domain 发布。完整来源与许可证记录见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [素材许可证](assets/tiles/LICENSE.md)。项目代码与第三方素材分别遵循各自的权利声明。
+
+可以替换为自己的牌图，但应保留现有文件名、透明背景和 600×800 像素规格。程序启动时会检查全部 39 个必需文件及其尺寸；替换不完整时会显示明确错误，不会混用两套图案。
 
