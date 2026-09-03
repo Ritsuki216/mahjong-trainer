@@ -617,6 +617,23 @@ QUESTION_BUCKETS: Tuple[str, ...] = (
 )
 QUESTION_WEIGHTS: Tuple[float, ...] = (80.0, 7.0, 7.0, 3.0, 2.0, 1.0)
 
+# 普通题先按符数抽取，再从该符数的有效番数中抽取。30、40 符在实战中
+# 最常见，因此占主要权重；70 符仍会出现，但只保留少量练习机会。
+# 荣和不存在 20 符时，会自动在其余有效符数之间按比例重新归一化。
+NORMAL_FU_WEIGHTS: Dict[int, float] = {
+    20: 12.0,
+    25: 8.0,
+    30: 42.0,
+    40: 26.0,
+    50: 10.0,
+    70: 2.0,
+}
+
+# 同一符数下番数通常等权；1 番 70 符属于尤其少见的组合，再降为四分之一权重。
+NORMAL_COMBO_WEIGHT_OVERRIDES: Dict[Tuple[int, int], float] = {
+    (70, 1): 0.25,
+}
+
 BUCKET_HAN: Dict[str, Tuple[int, ...]] = {
     "mangan": (5,),
     "haneman": (6, 7),
@@ -630,6 +647,36 @@ def choose_question_bucket(rng: random.Random) -> str:
     """按 80/7/7/3/2/1 权重选择普通题或限制点档位。"""
 
     return rng.choices(QUESTION_BUCKETS, weights=QUESTION_WEIGHTS, k=1)[0]
+
+
+def choose_normal_combo(win_type: str, rng: random.Random) -> Tuple[int, int]:
+    """按常见度选择有效的普通题符数，再选择对应番数。"""
+
+    valid_fu_values = [
+        fu for fu in FU_VALUES
+        if any(is_valid_normal_combo(win_type, fu, han) for han in NORMAL_HAN_VALUES)
+    ]
+    if not valid_fu_values:
+        raise ValueError("win_type 必须是 'ron' 或 'tsumo'")
+
+    fu = rng.choices(
+        valid_fu_values,
+        weights=[NORMAL_FU_WEIGHTS[value] for value in valid_fu_values],
+        k=1,
+    )[0]
+    valid_han_values = [
+        han for han in NORMAL_HAN_VALUES
+        if is_valid_normal_combo(win_type, fu, han)
+    ]
+    han = rng.choices(
+        valid_han_values,
+        weights=[
+            NORMAL_COMBO_WEIGHT_OVERRIDES.get((fu, value), 1.0)
+            for value in valid_han_values
+        ],
+        k=1,
+    )[0]
+    return fu, han
 
 
 def _templates_for(win_type: str, family: str, fu: int, han: int) -> List[HandTemplate]:
@@ -658,13 +705,7 @@ def create_question(rng: Optional[random.Random] = None) -> Question:
     win_type = rng.choice(("ron", "tsumo"))
 
     if bucket == "normal":
-        valid_pairs = [
-            (fu, han)
-            for fu in FU_VALUES
-            for han in NORMAL_HAN_VALUES
-            if is_valid_normal_combo(win_type, fu, han)
-        ]
-        fu, han = rng.choice(valid_pairs)
+        fu, han = choose_normal_combo(win_type, rng)
         candidates = _templates_for(win_type, "normal", fu, han)
         tier = "普通手"
     else:
@@ -1021,6 +1062,36 @@ def run_self_checks(include_frequency_test: bool = False) -> None:
             assert abs(actual_percent - expected_percent) < 0.8, (
                 bucket, actual_percent, expected_percent
             )
+
+        # 普通题符数权重也用固定种子抽样。无效符数会被排除，其余权重按比例归一化。
+        assert set(NORMAL_FU_WEIGHTS) == set(FU_VALUES)
+        assert all(weight > 0 for weight in NORMAL_FU_WEIGHTS.values())
+        assert sum(NORMAL_FU_WEIGHTS.values()) == 100.0
+        for win_type in ("ron", "tsumo"):
+            combo_rng = random.Random("20260903-{}".format(win_type))
+            combo_counts = Counter(
+                choose_normal_combo(win_type, combo_rng) for _ in range(sample_size)
+            )
+            valid_fu_values = [
+                fu for fu in FU_VALUES
+                if any(
+                    is_valid_normal_combo(win_type, fu, han)
+                    for han in NORMAL_HAN_VALUES
+                )
+            ]
+            total_weight = sum(NORMAL_FU_WEIGHTS[fu] for fu in valid_fu_values)
+            for fu in valid_fu_values:
+                actual_percent = sum(
+                    count for (sampled_fu, _), count in combo_counts.items()
+                    if sampled_fu == fu
+                ) * 100.0 / sample_size
+                expected_percent = NORMAL_FU_WEIGHTS[fu] * 100.0 / total_weight
+                assert abs(actual_percent - expected_percent) < 0.8, (
+                    win_type, fu, actual_percent, expected_percent
+                )
+
+            # 1 番 70 符保留覆盖，但应明显少于同为 70 符的普通番数组合。
+            assert 0 < combo_counts[(70, 1)] < combo_counts[(70, 2)] * 0.4
 
 
 # ---------------------------------------------------------------------------
