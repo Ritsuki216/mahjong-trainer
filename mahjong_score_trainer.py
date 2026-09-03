@@ -5,8 +5,8 @@
 1. 只使用 Python 标准库，不需要安装第三方包；
 2. 使用同一套高清 PNG 麻将牌素材，图形界面仍只依赖 tkinter；
 3. 覆盖 1～13 番、亲家/子家、荣和/自摸；
-4. 每题有 5 秒计时，但超时后仍可继续输入答案；
-5. 每 10 题分别统计答案正确率和 5 秒内答对率。
+4. 点击开始后按题正计时，统计正确率和平均完成时间；
+5. 每题结束后把累计统计和最近 1000 场摘要保存到用户选择的本地文件。
 
 运行方式：
     Windows:    py mahjong_score_trainer.py
@@ -18,12 +18,18 @@
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import random
+import shutil
 import sys
+import tempfile
 import time
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -32,9 +38,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # 因此这里捕获导入错误，并在 main() 中输出易懂的提示。
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import filedialog, messagebox
 except ImportError as exc:  # pragma: no cover - 仅在系统缺少 Tk 时执行
     tk = None  # type: ignore
+    filedialog = None  # type: ignore
     messagebox = None  # type: ignore
     TK_IMPORT_ERROR = exc
 else:
@@ -42,7 +49,347 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# 一、点数表与计分函数
+# 一、本地设置与训练统计
+# ---------------------------------------------------------------------------
+
+SETTINGS_VERSION = 1
+STATISTICS_VERSION = 1
+MAX_SESSION_HISTORY = 1000
+RECENT_SESSION_DISPLAY = 5
+
+
+class StorageError(RuntimeError):
+    """配置或统计文件无法安全读取、验证或写入时抛出的错误。"""
+
+
+def _application_directory(kind: str) -> Path:
+    """按操作系统返回应用配置或数据目录，不把用户数据写进代码仓库。"""
+
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA")
+        return (Path(base) if base else Path.home() / "AppData" / "Local") / "MahjongScoreTrainer"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "MahjongScoreTrainer"
+    if kind == "config":
+        base = os.environ.get("XDG_CONFIG_HOME")
+        return (Path(base) if base else Path.home() / ".config") / "mahjong-score-trainer"
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else Path.home() / ".local" / "share") / "mahjong-score-trainer"
+
+
+def default_settings_path() -> Path:
+    """返回用于记住用户所选统计路径的配置文件位置。"""
+
+    return _application_directory("config") / "config.json"
+
+
+def default_statistics_path() -> Path:
+    """返回用户尚未自选位置时使用的统计文件位置。"""
+
+    return _application_directory("data") / "statistics.json"
+
+
+def _timestamped_sibling(path: Path, label: str) -> Path:
+    """生成不会覆盖旧备份的同目录时间戳文件名。"""
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    candidate = path.with_name("{}.{}-{}{}".format(path.stem, label, stamp, path.suffix))
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(
+            "{}.{}-{}-{}{}".format(path.stem, label, stamp, counter, path.suffix)
+        )
+        counter += 1
+    return candidate
+
+
+def _write_json_atomically(path: Path, payload: Dict[str, object]) -> None:
+    """在目标目录写临时文件并原子替换，避免中断留下半份 JSON。"""
+
+    temporary_path: Optional[Path] = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(str(temporary_path), str(path))
+        temporary_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        raise StorageError("无法安全写入 {}：{}".format(path, exc)) from exc
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def _load_json_object(path: Path) -> Dict[str, object]:
+    """读取 JSON 根对象；错误统一转换为可展示的 StorageError。"""
+
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StorageError("无法读取 {}：{}".format(path, exc)) from exc
+    if not isinstance(payload, dict):
+        raise StorageError("{} 的 JSON 根节点必须是对象。".format(path))
+    return payload
+
+
+def _non_negative_int(value: object, name: str) -> int:
+    """严格验证非负整数，避免把 JSON 布尔值误当成 0/1。"""
+
+    if type(value) is not int or value < 0:
+        raise StorageError("{} 必须是非负整数。".format(name))
+    return value
+
+
+def _non_negative_float(value: object, name: str) -> float:
+    """验证有限非负数值。"""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StorageError("{} 必须是非负数值。".format(name))
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise StorageError("{} 必须是有限非负数值。".format(name))
+    return result
+
+
+def _validate_started_at(value: object) -> str:
+    """验证场次开始时间为带时区的 ISO 8601 字符串。"""
+
+    if not isinstance(value, str):
+        raise StorageError("started_at 必须是 ISO 8601 字符串。")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise StorageError("started_at 不是有效的 ISO 8601 时间。") from exc
+    if parsed.tzinfo is None:
+        raise StorageError("started_at 必须包含时区。")
+    return value
+
+
+@dataclass
+class SessionStatistics:
+    """一次启动训练后的场次摘要；不保存具体牌型或用户输入。"""
+
+    started_at: str
+    completed: int = 0
+    correct: int = 0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def average_seconds(self) -> float:
+        return self.elapsed_seconds / self.completed if self.completed else 0.0
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "started_at": self.started_at,
+            "completed": self.completed,
+            "correct": self.correct,
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SessionStatistics":
+        if not isinstance(payload, dict):
+            raise StorageError("sessions 中的每一项都必须是对象。")
+        completed = _non_negative_int(payload.get("completed"), "session.completed")
+        correct = _non_negative_int(payload.get("correct"), "session.correct")
+        if completed == 0:
+            raise StorageError("场次摘要不能是未完成任何题目的空场次。")
+        if correct > completed:
+            raise StorageError("session.correct 不能大于 session.completed。")
+        return cls(
+            started_at=_validate_started_at(payload.get("started_at")),
+            completed=completed,
+            correct=correct,
+            elapsed_seconds=_non_negative_float(
+                payload.get("elapsed_seconds"), "session.elapsed_seconds"
+            ),
+        )
+
+
+@dataclass
+class TrainingStatistics:
+    """跨场次累计统计，以及最多 1000 条最近场次摘要。"""
+
+    completed: int = 0
+    correct: int = 0
+    elapsed_seconds: float = 0.0
+    sessions: List[SessionStatistics] = field(default_factory=list)
+
+    @property
+    def average_seconds(self) -> float:
+        return self.elapsed_seconds / self.completed if self.completed else 0.0
+
+    def record_answer(
+        self,
+        session: SessionStatistics,
+        is_correct: bool,
+        elapsed_seconds: float,
+    ) -> None:
+        """把一次首次提交同时计入当前场次和历史累计。"""
+
+        elapsed = _non_negative_float(elapsed_seconds, "elapsed_seconds")
+        if session.completed == 0:
+            self.sessions.append(session)
+        session.completed += 1
+        session.correct += int(is_correct)
+        session.elapsed_seconds += elapsed
+        self.completed += 1
+        self.correct += int(is_correct)
+        self.elapsed_seconds += elapsed
+        if len(self.sessions) > MAX_SESSION_HISTORY:
+            del self.sessions[:-MAX_SESSION_HISTORY]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "version": STATISTICS_VERSION,
+            "totals": {
+                "completed": self.completed,
+                "correct": self.correct,
+                "elapsed_seconds": self.elapsed_seconds,
+            },
+            "sessions": [item.to_dict() for item in self.sessions[-MAX_SESSION_HISTORY:]],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object]) -> "TrainingStatistics":
+        if type(payload.get("version")) is not int or payload.get("version") != STATISTICS_VERSION:
+            raise StorageError("不支持的统计文件版本。")
+        totals = payload.get("totals")
+        sessions_payload = payload.get("sessions")
+        if not isinstance(totals, dict) or not isinstance(sessions_payload, list):
+            raise StorageError("统计文件缺少 totals 或 sessions。")
+        completed = _non_negative_int(totals.get("completed"), "totals.completed")
+        correct = _non_negative_int(totals.get("correct"), "totals.correct")
+        if correct > completed:
+            raise StorageError("totals.correct 不能大于 totals.completed。")
+        sessions = [SessionStatistics.from_dict(item) for item in sessions_payload]
+        elapsed_seconds = _non_negative_float(
+            totals.get("elapsed_seconds"), "totals.elapsed_seconds"
+        )
+        if completed < sum(item.completed for item in sessions):
+            raise StorageError("累计完成题数不能小于场次明细之和。")
+        if correct < sum(item.correct for item in sessions):
+            raise StorageError("累计正确题数不能小于场次明细之和。")
+        if elapsed_seconds + 1e-9 < sum(item.elapsed_seconds for item in sessions):
+            raise StorageError("累计用时不能小于场次明细之和。")
+        return cls(
+            completed=completed,
+            correct=correct,
+            elapsed_seconds=elapsed_seconds,
+            sessions=sessions[-MAX_SESSION_HISTORY:],
+        )
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    """当前统计文件位置。配置文件本身始终保存在系统标准目录。"""
+
+    statistics_path: Path
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "version": SETTINGS_VERSION,
+            "statistics_path": str(self.statistics_path),
+        }
+
+
+class SettingsStore:
+    """加载并保存用户选择的统计文件位置。"""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = (path or default_settings_path()).expanduser().resolve()
+
+    def load(self) -> Tuple[AppSettings, Optional[str]]:
+        fallback = AppSettings(default_statistics_path().expanduser().resolve())
+        if not self.path.exists():
+            return fallback, None
+        try:
+            payload = _load_json_object(self.path)
+            if type(payload.get("version")) is not int or payload.get("version") != SETTINGS_VERSION:
+                raise StorageError("不支持的配置文件版本。")
+            raw_path = payload.get("statistics_path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise StorageError("statistics_path 必须是非空字符串。")
+            selected = Path(raw_path).expanduser()
+            if not selected.is_absolute():
+                raise StorageError("statistics_path 必须是绝对路径。")
+            return AppSettings(selected.resolve()), None
+        except StorageError as exc:
+            try:
+                backup = _timestamped_sibling(self.path, "corrupt")
+                self.path.replace(backup)
+            except OSError as backup_exc:
+                raise StorageError(
+                    "配置损坏且无法隔离：{}；{}".format(exc, backup_exc)
+                ) from backup_exc
+            return fallback, "配置文件损坏，已保留为 {} 并恢复默认位置。".format(backup)
+
+    def save(self, settings: AppSettings) -> None:
+        if not settings.statistics_path.expanduser().is_absolute():
+            raise StorageError("statistics_path 必须是绝对路径。")
+        _write_json_atomically(self.path, settings.to_dict())
+
+
+class StatisticsStore:
+    """对单个用户可选 JSON 文件执行验证、恢复和原子保存。"""
+
+    def __init__(self, path: Path) -> None:
+        selected = path.expanduser()
+        if not selected.is_absolute():
+            raise StorageError("统计文件路径必须是绝对路径。")
+        self.path = selected.resolve()
+
+    def load(self, recover: bool = True) -> Tuple[TrainingStatistics, Optional[str]]:
+        if not self.path.exists():
+            return TrainingStatistics(), None
+        try:
+            return TrainingStatistics.from_dict(_load_json_object(self.path)), None
+        except StorageError as exc:
+            if not recover:
+                raise
+            try:
+                backup = _timestamped_sibling(self.path, "corrupt")
+                self.path.replace(backup)
+            except OSError as backup_exc:
+                raise StorageError(
+                    "统计文件损坏且无法隔离：{}；{}".format(exc, backup_exc)
+                ) from backup_exc
+            empty = TrainingStatistics()
+            self.save(empty)
+            return empty, "统计文件损坏，已保留为 {} 并创建空统计。".format(backup)
+
+    def save(self, statistics: TrainingStatistics) -> None:
+        payload = statistics.to_dict()
+        # 写盘前再走一次完整校验，避免调用者构造非法对象污染已有文件。
+        TrainingStatistics.from_dict(payload)
+        _write_json_atomically(self.path, payload)
+
+    def back_up_existing(self) -> Optional[Path]:
+        """复制一份目标文件备份；不删除或移动用户原文件。"""
+
+        if not self.path.exists():
+            return None
+        backup = _timestamped_sibling(self.path, "backup")
+        try:
+            shutil.copy2(str(self.path), str(backup))
+        except OSError as exc:
+            raise StorageError("无法备份 {}：{}".format(self.path, exc)) from exc
+        return backup
+
+
+# ---------------------------------------------------------------------------
+# 二、点数表与计分函数
 # ---------------------------------------------------------------------------
 
 # 用户指定的子家荣和表。None 表示牌理上不存在的组合：
@@ -220,7 +567,7 @@ def is_valid_normal_combo(win_type: str, fu: int, han: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 二、牌型模板与宝牌控制
+# 三、牌型模板与宝牌控制
 # ---------------------------------------------------------------------------
 
 # 牌编码约定：1m～9m 为万子，1p～9p 为筒子，1s～9s 为索子；
@@ -608,7 +955,7 @@ HAND_TEMPLATES: Tuple[HandTemplate, ...] = build_templates()
 
 
 # ---------------------------------------------------------------------------
-# 三、加权随机出题
+# 四、加权随机出题
 # ---------------------------------------------------------------------------
 
 # 权重直接以“全部题目的百分比”表示，总和为 100。
@@ -727,7 +1074,7 @@ def create_question(rng: Optional[random.Random] = None) -> Question:
 
 
 # ---------------------------------------------------------------------------
-# 四、输入解析、格式化与自检
+# 五、输入解析、格式化与自检
 # ---------------------------------------------------------------------------
 
 TILE_NAMES: Dict[str, str] = {
@@ -1000,6 +1347,158 @@ def validate_template(template: HandTemplate) -> None:
             raise AssertionError("{} 未准确补足番数".format(template.key))
 
 
+def run_storage_self_checks() -> None:
+    """在临时目录验证统计恢复、场次上限、备份和原子写入。"""
+
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        base = Path(temporary_directory)
+        statistics_path = (base / "chosen" / "statistics.json").resolve()
+        statistics_store = StatisticsStore(statistics_path)
+
+        # 正确题、错误题和格式错误在数据层都是“已完成题”，平均值包含它们。
+        statistics = TrainingStatistics()
+        session = SessionStatistics("2026-09-03T18:00:00+08:00")
+        statistics.record_answer(session, True, 2.0)
+        statistics.record_answer(session, False, 4.0)
+        assert statistics.completed == 2
+        assert statistics.correct == 1
+        assert statistics.average_seconds == 3.0
+        assert session.average_seconds == 3.0
+        statistics_store.save(statistics)
+        loaded, warning = statistics_store.load()
+        assert warning is None
+        assert loaded.completed == 2 and loaded.correct == 1
+        assert loaded.average_seconds == 3.0
+        assert len(loaded.sessions) == 1
+
+        # 配置文件只保存绝对路径，并能在下一次启动恢复用户选择。
+        settings_store = SettingsStore(base / "config" / "config.json")
+        settings_store.save(AppSettings(statistics_path))
+        loaded_settings, settings_warning = settings_store.load()
+        assert settings_warning is None
+        assert loaded_settings.statistics_path == statistics_path
+        try:
+            settings_store.save(AppSettings(Path("relative-statistics.json")))
+        except StorageError:
+            pass
+        else:
+            raise AssertionError("配置不得保存相对统计路径")
+
+        invalid_settings_path = base / "invalid-config.json"
+        invalid_settings_path.write_text('{"version": 99}', encoding="utf-8")
+        recovered_settings, invalid_settings_warning = SettingsStore(
+            invalid_settings_path
+        ).load()
+        assert invalid_settings_warning
+        assert recovered_settings.statistics_path == default_statistics_path().resolve()
+        assert list(base.glob("invalid-config.corrupt-*.json"))
+
+        # 达到第 1001 场时只淘汰最早的场次摘要，历史累计值不能减少。
+        capped = TrainingStatistics()
+        first_session = SessionStatistics("2026-01-01T00:00:00+00:00")
+        capped.record_answer(first_session, True, 1.0)
+        for index in range(MAX_SESSION_HISTORY):
+            item = SessionStatistics("2026-01-02T00:00:00+00:00")
+            capped.record_answer(item, index % 2 == 0, 2.0)
+        assert capped.completed == MAX_SESSION_HISTORY + 1
+        assert len(capped.sessions) == MAX_SESSION_HISTORY
+        assert first_session not in capped.sessions
+        capped_store = StatisticsStore((base / "capped.json").resolve())
+        capped_store.save(capped)
+        reloaded_capped, _warning = capped_store.load()
+        assert reloaded_capped.completed == MAX_SESSION_HISTORY + 1
+        assert len(reloaded_capped.sessions) == MAX_SESSION_HISTORY
+
+        # 非法计数关系、空场次和布尔版本号均不能被当作有效统计。
+        invalid_payloads = (
+            {
+                "version": True,
+                "totals": {"completed": 0, "correct": 0, "elapsed_seconds": 0},
+                "sessions": [],
+            },
+            {
+                "version": 1,
+                "totals": {"completed": 1, "correct": 2, "elapsed_seconds": 1},
+                "sessions": [],
+            },
+            {
+                "version": 1,
+                "totals": {"completed": 0, "correct": 0, "elapsed_seconds": 0},
+                "sessions": [
+                    {
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "completed": 0,
+                        "correct": 0,
+                        "elapsed_seconds": 0,
+                    }
+                ],
+            },
+        )
+        for payload in invalid_payloads:
+            try:
+                TrainingStatistics.from_dict(payload)
+            except StorageError:
+                pass
+            else:
+                raise AssertionError("非法统计字段应被拒绝")
+
+        # 严格读取损坏文件不能修改原文件；恢复模式则隔离原文件并创建空统计。
+        corrupt_path = base / "corrupt.json"
+        corrupt_path.write_text("{broken", encoding="utf-8")
+        corrupt_store = StatisticsStore(corrupt_path.resolve())
+        try:
+            corrupt_store.load(recover=False)
+        except StorageError:
+            pass
+        else:
+            raise AssertionError("严格模式应拒绝损坏的统计文件")
+        assert corrupt_path.read_text(encoding="utf-8") == "{broken"
+        recovered, recovery_warning = corrupt_store.load(recover=True)
+        assert recovered.completed == 0 and recovery_warning
+        assert list(base.glob("corrupt.corrupt-*.json"))
+
+        unsupported_path = base / "unsupported.json"
+        _write_json_atomically(
+            unsupported_path,
+            {"version": 99, "totals": {}, "sessions": []},
+        )
+        try:
+            StatisticsStore(unsupported_path.resolve()).load(recover=False)
+        except StorageError:
+            pass
+        else:
+            raise AssertionError("严格模式应拒绝未知统计版本")
+
+        # 覆盖已有目标前必须能复制出内容一致的时间戳备份。
+        backup_path = corrupt_store.back_up_existing()
+        assert backup_path is not None and backup_path.read_bytes() == corrupt_path.read_bytes()
+
+        # 原子替换失败时原文件内容保持不变，临时文件会被清理。
+        original_bytes = corrupt_path.read_bytes()
+        with mock.patch("os.replace", side_effect=OSError("simulated replace failure")):
+            try:
+                corrupt_store.save(TrainingStatistics(completed=1, elapsed_seconds=1.0))
+            except StorageError:
+                pass
+            else:
+                raise AssertionError("原子替换失败应报告 StorageError")
+        assert corrupt_path.read_bytes() == original_bytes
+        assert not list(base.glob(".corrupt.json-*.tmp"))
+
+        # 父路径本身是文件时无法建立目录，必须给出保存错误。
+        blocker = base / "not-a-directory"
+        blocker.write_text("block", encoding="utf-8")
+        unwritable_store = StatisticsStore((blocker / "statistics.json").resolve())
+        try:
+            unwritable_store.save(TrainingStatistics())
+        except StorageError:
+            pass
+        else:
+            raise AssertionError("无效父路径应报告 StorageError")
+
+
 def run_self_checks(include_frequency_test: bool = False) -> None:
     """运行无需图形界面的内置自检。失败时会抛出 AssertionError。"""
 
@@ -1053,6 +1552,7 @@ def run_self_checks(include_frequency_test: bool = False) -> None:
 
     # 统计测试只在 --self-test 下执行，避免每次打开窗口都做大量随机抽样。
     if include_frequency_test:
+        run_storage_self_checks()
         rng = random.Random(20260903)
         sample_size = 100000
         counts = Counter(choose_question_bucket(rng) for _ in range(sample_size))
@@ -1095,7 +1595,7 @@ def run_self_checks(include_frequency_test: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 五、Tkinter 图形界面
+# 六、Tkinter 图形界面
 # ---------------------------------------------------------------------------
 
 
@@ -1107,29 +1607,70 @@ class MahjongTrainerApp:
     TEXT_DARK = "#17221c"
     ACCENT = "#c73b32"
 
-    def __init__(self, root: object) -> None:
+    def __init__(
+        self,
+        root: object,
+        settings_store: Optional[SettingsStore] = None,
+        statistics_store: Optional[StatisticsStore] = None,
+    ) -> None:
         self.root = root
         self.rng = random.Random()
         self.question: Optional[Question] = None
+        self.current_session: Optional[SessionStatistics] = None
         self.started_at = 0.0
         self.answered = False
         self.timer_generation = 0
+        self.current_view = "start"
 
-        self.total_answers = 0
-        self.correct_answers = 0
-        self.fast_correct_answers = 0
+        self.settings_store = settings_store or SettingsStore()
+        storage_messages: List[str] = []
+        if statistics_store is None:
+            try:
+                self.settings, settings_warning = self.settings_store.load()
+            except StorageError as exc:
+                self.settings = AppSettings(default_statistics_path().resolve())
+                settings_warning = "无法恢复路径配置，暂时使用默认位置：{}".format(exc)
+            if settings_warning:
+                storage_messages.append(settings_warning)
+            self.statistics_store = StatisticsStore(self.settings.statistics_path)
+        else:
+            self.statistics_store = statistics_store
+            self.settings = AppSettings(statistics_store.path)
+
+        self.storage_ready = False
+        try:
+            self.statistics, statistics_warning = self.statistics_store.load(recover=True)
+        except StorageError as exc:
+            self.statistics = TrainingStatistics()
+            statistics_warning = "当前统计位置不可用，请更换保存位置：{}".format(exc)
+        else:
+            try:
+                # 启动时即验证目录可创建、文件可原子替换，避免答完第一题才发现无法保存。
+                self.statistics_store.save(self.statistics)
+            except StorageError as exc:
+                # 已成功读取的历史仍保留在内存，用户可以将其复制到新的可写位置。
+                write_warning = "当前统计文件不可写，请复制到新的保存位置：{}".format(exc)
+                statistics_warning = "\n".join(
+                    item for item in (statistics_warning, write_warning) if item
+                )
+            else:
+                self.storage_ready = True
+        if statistics_warning:
+            storage_messages.append(statistics_warning)
+        self.initial_storage_message = "\n".join(storage_messages)
 
         # PhotoImage 必须在 Tk 根窗口创建之后加载，并要由长生命周期对象持有引用。
         self.tile_images = TileImageStore()
         self._build_window()
-        self.next_question()
+        self._show_start_view()
 
     def _build_window(self) -> None:
-        """创建固定布局；牌面本身在 Canvas 中按题目重绘。"""
+        """创建共享页头、历史启动页和训练页。"""
 
         self.root.title("日麻点数计算训练器")
         self.root.geometry("1120x760")
-        self.root.minsize(1020, 700)
+        # 保证 125%/150% 字体缩放时统计页和训练页仍完整可见。
+        self.root.minsize(1100, 760)
         self.root.configure(bg=self.PANEL_BG)
 
         header = tk.Frame(self.root, bg="#18392c", padx=22, pady=14)
@@ -1145,16 +1686,125 @@ class MahjongTrainerApp:
         tk.Button(
             header, text="退出", command=self.root.destroy,
             bg="#2c5947", fg="white", activebackground="#376c57",
-            activeforeground="white", relief="flat", padx=18, pady=10
+            activeforeground="white", relief="flat", padx=18, pady=11
         ).pack(side="right")
 
-        info = tk.Frame(self.root, bg=self.PANEL_BG, padx=24, pady=12)
+        self.content = tk.Frame(self.root, bg=self.PANEL_BG)
+        self.content.pack(fill="both", expand=True)
+        self._build_start_view()
+        self._build_training_view()
+
+        self.root.bind("<Return>", self._handle_enter)
+        self.root.bind("<Escape>", lambda _event: self.root.destroy())
+
+    def _build_start_view(self) -> None:
+        """构建启动历史页；此时没有题目，也不运行计时器。"""
+
+        self.start_frame = tk.Frame(self.content, bg=self.PANEL_BG, padx=34, pady=24)
+
+        tk.Label(
+            self.start_frame,
+            text="历史训练统计",
+            bg=self.PANEL_BG,
+            fg=self.TEXT_DARK,
+            font=("Microsoft YaHei", 22, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            self.start_frame,
+            text="确认历史数据和保存位置后，再开始本次训练。",
+            bg=self.PANEL_BG,
+            fg="#607066",
+            font=("Microsoft YaHei", 11),
+        ).pack(anchor="w", pady=(4, 18))
+
+        cards = tk.Frame(self.start_frame, bg=self.PANEL_BG)
+        cards.pack(fill="x")
+        self.history_completed_var = tk.StringVar()
+        self.history_accuracy_var = tk.StringVar()
+        self.history_average_var = tk.StringVar()
+        for title, variable in (
+            ("历史完成", self.history_completed_var),
+            ("历史正确率", self.history_accuracy_var),
+            ("平均完成时间", self.history_average_var),
+        ):
+            card = tk.Frame(cards, bg="#e8e3d8", padx=18, pady=14)
+            card.pack(side="left", fill="x", expand=True, padx=(0, 10))
+            tk.Label(
+                card, text=title, bg="#e8e3d8", fg="#607066",
+                font=("Microsoft YaHei", 10), anchor="w"
+            ).pack(fill="x")
+            tk.Label(
+                card, textvariable=variable, bg="#e8e3d8", fg=self.TEXT_DARK,
+                font=("Microsoft YaHei", 18, "bold"), anchor="w"
+            ).pack(fill="x", pady=(4, 0))
+
+        history_panel = tk.Frame(self.start_frame, bg="white", padx=18, pady=14)
+        history_panel.pack(fill="x", pady=(18, 12))
+        tk.Label(
+            history_panel, text="最近 5 场", bg="white", fg=self.TEXT_DARK,
+            font=("Microsoft YaHei", 12, "bold"), anchor="w"
+        ).pack(fill="x")
+        self.recent_sessions_var = tk.StringVar()
+        tk.Label(
+            history_panel, textvariable=self.recent_sessions_var,
+            bg="white", fg="#34443b", font=("Consolas", 10),
+            anchor="w", justify="left"
+        ).pack(fill="x", pady=(8, 0))
+
+        location_panel = tk.Frame(self.start_frame, bg="#e8e3d8", padx=16, pady=12)
+        location_panel.pack(fill="x")
+        tk.Label(
+            location_panel, text="统计文件位置", bg="#e8e3d8", fg=self.TEXT_DARK,
+            font=("Microsoft YaHei", 10, "bold"), anchor="w"
+        ).pack(fill="x")
+        self.statistics_path_var = tk.StringVar()
+        tk.Label(
+            location_panel, textvariable=self.statistics_path_var,
+            bg="#e8e3d8", fg="#34443b", font=("Consolas", 9),
+            anchor="w", justify="left", wraplength=990
+        ).pack(fill="x", pady=(4, 0))
+
+        self.start_warning_var = tk.StringVar()
+        self.start_warning_label = tk.Label(
+            self.start_frame, textvariable=self.start_warning_var,
+            bg=self.PANEL_BG, fg=self.ACCENT, font=("Microsoft YaHei", 10, "bold"),
+            anchor="w", justify="left", wraplength=1030
+        )
+        self.start_warning_label.pack(fill="x", pady=(10, 0))
+
+        actions = tk.Frame(self.start_frame, bg=self.PANEL_BG)
+        actions.pack(fill="x", pady=(14, 0))
+        self.start_button = tk.Button(
+            actions, text="开始训练", command=self.start_training,
+            bg="#176b48", fg="white", activebackground="#0f5135",
+            activeforeground="white", relief="flat", padx=30,
+            font=("Microsoft YaHei", 12, "bold")
+        )
+        self.start_button.pack(side="left", ipady=10)
+        tk.Button(
+            actions, text="更改保存位置", command=self.change_statistics_location,
+            bg="#345b73", fg="white", activebackground="#29495c",
+            activeforeground="white", relief="flat", padx=24,
+            font=("Microsoft YaHei", 11, "bold")
+        ).pack(side="left", padx=(10, 0), ipady=10)
+        tk.Button(
+            actions, text="退出", command=self.root.destroy,
+            bg="#ded8ca", fg=self.TEXT_DARK, activebackground="#cec6b7",
+            relief="flat", padx=24, font=("Microsoft YaHei", 11, "bold")
+        ).pack(side="right", ipady=10)
+
+    def _build_training_view(self) -> None:
+        """构建开始训练后显示的题目和答案区域。"""
+
+        self.training_frame = tk.Frame(self.content, bg=self.PANEL_BG)
+        info = tk.Frame(self.training_frame, bg=self.PANEL_BG, padx=24, pady=12)
         info.pack(fill="x")
         self.question_var = tk.StringVar()
         self.timer_var = tk.StringVar()
         tk.Label(
             info, textvariable=self.question_var, bg=self.PANEL_BG, fg=self.TEXT_DARK,
-            font=("Microsoft YaHei", 15, "bold"), anchor="w"
+            font=("Microsoft YaHei", 15, "bold"), anchor="w",
+            justify="left", wraplength=760
         ).pack(side="left", fill="x", expand=True)
         self.timer_label = tk.Label(
             info, textvariable=self.timer_var, bg=self.PANEL_BG, fg="#176b48",
@@ -1163,13 +1813,13 @@ class MahjongTrainerApp:
         self.timer_label.pack(side="right")
 
         self.canvas = tk.Canvas(
-            self.root, height=300, bg=self.TABLE_GREEN,
+            self.training_frame, height=300, bg=self.TABLE_GREEN,
             highlightthickness=0, bd=0
         )
         self.canvas.pack(fill="x", padx=24)
         self.canvas.bind("<Configure>", lambda _event: self.draw_question())
 
-        answer_panel = tk.Frame(self.root, bg=self.PANEL_BG, padx=24, pady=14)
+        answer_panel = tk.Frame(self.training_frame, bg=self.PANEL_BG, padx=24, pady=14)
         answer_panel.pack(fill="x")
         self.prompt_var = tk.StringVar()
         tk.Label(
@@ -1214,7 +1864,14 @@ class MahjongTrainerApp:
             justify="left", wraplength=1020, padx=12, pady=9
         ).pack(fill="x", pady=(8, 0))
 
-        footer = tk.Frame(self.root, bg="#e1dccf", padx=24, pady=10)
+        self.storage_warning_var = tk.StringVar()
+        self.storage_warning_label = tk.Label(
+            answer_panel, textvariable=self.storage_warning_var,
+            bg=self.PANEL_BG, fg=self.ACCENT, font=("Microsoft YaHei", 9, "bold"),
+            anchor="w", justify="left", wraplength=1030
+        )
+
+        footer = tk.Frame(self.training_frame, bg="#e1dccf", padx=24, pady=10)
         footer.pack(side="bottom", fill="x")
         self.stats_var = tk.StringVar()
         tk.Label(
@@ -1222,18 +1879,210 @@ class MahjongTrainerApp:
             font=("Microsoft YaHei", 10, "bold"), anchor="w"
         ).pack(side="left")
         tk.Label(
-            footer, text="Enter：提交/下一题　　超时后仍可作答",
+            footer, text="Enter：提交/下一题　　Esc：退出",
             bg="#e1dccf", fg="#607066", font=("Microsoft YaHei", 9)
         ).pack(side="right")
 
-        self.root.bind("<Return>", self._handle_enter)
+    def _show_start_view(self) -> None:
+        """停止题目计时并显示最新历史统计。"""
+
+        self.current_view = "start"
+        self.timer_generation += 1
+        self.question = None
+        self.answered = False
+        self.training_frame.pack_forget()
+        self.start_frame.pack(fill="both", expand=True)
+        self._refresh_start_statistics()
+        self._set_start_status(self.initial_storage_message, is_error=True)
+        self.start_button.configure(state="normal" if self.storage_ready else "disabled")
+        self.start_button.focus_set()
+
+    def _set_start_status(self, message: str, is_error: bool) -> None:
+        """以语义颜色显示启动页错误或成功状态，而不只依赖颜色传意。"""
+
+        self.start_warning_var.set(message)
+        self.start_warning_label.configure(fg=self.ACCENT if is_error else "#176b48")
+
+    def _refresh_start_statistics(self) -> None:
+        """刷新历史累计卡片、最近场次和当前文件路径。"""
+
+        self.history_completed_var.set("{} 题".format(self.statistics.completed))
+        if self.statistics.completed:
+            accuracy = self.statistics.correct * 100.0 / self.statistics.completed
+            self.history_accuracy_var.set("{:.1f}%".format(accuracy))
+            self.history_average_var.set("{:.2f} 秒".format(self.statistics.average_seconds))
+        else:
+            self.history_accuracy_var.set("--")
+            self.history_average_var.set("--")
+
+        recent_lines = []
+        for session in reversed(self.statistics.sessions[-RECENT_SESSION_DISPLAY:]):
+            started = datetime.fromisoformat(session.started_at).astimezone()
+            accuracy = session.correct * 100.0 / session.completed if session.completed else 0.0
+            recent_lines.append(
+                "{}  ｜ {:>3}题 ｜ 正确率 {:>5.1f}% ｜ 平均 {:>6.2f} 秒".format(
+                    started.strftime("%Y-%m-%d %H:%M"),
+                    session.completed,
+                    accuracy,
+                    session.average_seconds,
+                )
+            )
+        self.recent_sessions_var.set("\n".join(recent_lines) if recent_lines else "暂无历史记录")
+        self.statistics_path_var.set(str(self.statistics_store.path))
+
+    def start_training(self) -> None:
+        """从启动页进入训练；只有此时才创建场次和第一题。"""
+
+        if not self.storage_ready:
+            self._set_start_status("错误：当前统计文件不可写，请先更改保存位置。", True)
+            return
+        self.current_session = SessionStatistics(
+            datetime.now().astimezone().isoformat(timespec="seconds")
+        )
+        self.current_view = "training"
+        self.initial_storage_message = ""
+        self.start_frame.pack_forget()
+        self.training_frame.pack(fill="both", expand=True)
+        self._set_storage_warning("")
+        self.next_question()
+
+    def _set_storage_warning(self, message: str) -> None:
+        """仅在确有保存错误时占用训练页空间并展示修复提示。"""
+
+        self.storage_warning_var.set(message)
+        if message:
+            self.storage_warning_label.pack(fill="x", pady=(5, 0))
+        else:
+            self.storage_warning_label.pack_forget()
+
+    def _ask_location_action(self, target: Path) -> Optional[str]:
+        """用具名按钮询问复制当前统计、使用目标文件或取消。"""
+
+        result: Dict[str, Optional[str]] = {"value": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("选择统计文件处理方式")
+        dialog.configure(bg=self.PANEL_BG)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        exists_text = "该文件已经存在。" if target.exists() else "该文件尚不存在。"
+        tk.Label(
+            dialog,
+            text="{}\n请选择如何切换统计文件：\n{}".format(exists_text, target),
+            bg=self.PANEL_BG, fg=self.TEXT_DARK, font=("Microsoft YaHei", 10),
+            justify="left", wraplength=560, padx=22, pady=18
+        ).pack(fill="x")
+        buttons = tk.Frame(dialog, bg=self.PANEL_BG, padx=22, pady=(0, 18))
+        buttons.pack(fill="x")
+
+        def choose(value: Optional[str]) -> None:
+            result["value"] = value
+            dialog.destroy()
+
+        tk.Button(
+            buttons, text="复制当前统计", command=lambda: choose("copy"),
+            bg="#176b48", fg="white", relief="flat", padx=18,
+            font=("Microsoft YaHei", 10, "bold")
+        ).pack(side="left", ipady=9)
+        use_text = "读取所选文件" if target.exists() else "创建空统计"
+        tk.Button(
+            buttons, text=use_text, command=lambda: choose("use"),
+            bg="#345b73", fg="white", relief="flat", padx=18,
+            font=("Microsoft YaHei", 10, "bold")
+        ).pack(side="left", padx=(8, 0), ipady=9)
+        tk.Button(
+            buttons, text="取消", command=lambda: choose(None),
+            bg="#ded8ca", fg=self.TEXT_DARK, relief="flat", padx=18,
+            font=("Microsoft YaHei", 10, "bold")
+        ).pack(side="right", ipady=9)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dialog.bind("<Escape>", lambda _event: choose(None))
+        dialog.wait_visibility()
+        dialog.focus_set()
+        dialog.wait_window()
+        return result["value"]
+
+    def change_statistics_location(self) -> None:
+        """从启动页选择新 JSON，并以无数据丢失的事务方式完成切换。"""
+
+        if self.current_view != "start" or filedialog is None:
+            return
+        current_parent = self.statistics_store.path.parent
+        initial_directory = current_parent if current_parent.is_dir() else Path.home()
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="选择统计数据文件",
+            defaultextension=".json",
+            filetypes=(("JSON 文件", "*.json"),),
+            initialdir=str(initial_directory),
+            initialfile=self.statistics_store.path.name,
+            confirmoverwrite=False,
+        )
+        if not selected:
+            return
+        target = Path(selected).expanduser().resolve()
+        if target.suffix.lower() != ".json":
+            messagebox.showerror("文件类型不正确", "统计文件必须使用 .json 扩展名。")
+            return
+        if os.path.normcase(str(target)) == os.path.normcase(str(self.statistics_store.path)):
+            self._set_start_status("提示：当前已经使用这个统计文件。", False)
+            return
+
+        action = self._ask_location_action(target)
+        if action is None:
+            return
+        try:
+            backup = self._apply_statistics_location(target, action)
+        except StorageError as exc:
+            messagebox.showerror(
+                "无法更改统计位置",
+                "未切换统计文件，原位置和内存数据保持不变。\n\n{}".format(exc),
+            )
+            return
+
+        message = "统计文件已切换到：{}".format(self.statistics_store.path)
+        if backup is not None:
+            message += "\n原目标文件已备份为：{}".format(backup)
+        self._set_start_status("成功：{}".format(message), False)
+
+    def _apply_statistics_location(self, target: Path, action: str) -> Optional[Path]:
+        """执行已确认的复制/读取操作；全部成功后才切换当前存储对象。"""
+
+        if action not in ("copy", "use"):
+            raise StorageError("未知的统计文件处理方式。")
+        new_store = StatisticsStore(target)
+        backup: Optional[Path] = None
+        if action == "copy":
+            backup = new_store.back_up_existing()
+            new_store.save(self.statistics)
+            new_statistics = self.statistics
+        elif target.exists():
+            new_statistics, _warning = new_store.load(recover=False)
+            # 验证目标不仅可读，而且允许后续原子更新。
+            new_store.save(new_statistics)
+        else:
+            new_statistics = TrainingStatistics()
+            new_store.save(new_statistics)
+
+        new_settings = AppSettings(new_store.path)
+        self.settings_store.save(new_settings)
+        self.statistics_store = new_store
+        self.statistics = new_statistics
+        self.settings = new_settings
+        self.storage_ready = True
+        self.initial_storage_message = ""
+        self._refresh_start_statistics()
+        self.start_button.configure(state="normal")
+        return backup
 
     def next_question(self) -> None:
-        """生成并展示下一题，同时重新开始 5 秒计时。"""
+        """生成并展示下一题；牌面完成布局后才开始正计时。"""
 
+        if self.current_view != "training" or self.current_session is None:
+            return
         self.question = create_question(self.rng)
         self.answered = False
-        self.started_at = time.perf_counter()
         self.timer_generation += 1
         current_generation = self.timer_generation
 
@@ -1244,7 +2093,7 @@ class MahjongTrainerApp:
             suffix = " ｜ {}（符数不影响限制点）".format(self.question.tier)
         self.question_var.set(
             "第 {} 题 ｜ {} ｜ {} ｜ {}符 {}番{}".format(
-                self.total_answers + 1, role, win_text,
+                self.current_session.completed + 1, role, win_text,
                 self.question.fu, self.question.han, suffix
             )
         )
@@ -1266,27 +2115,25 @@ class MahjongTrainerApp:
         self.result_label.configure(fg=self.TEXT_DARK)
         self._update_stats_label()
         self.draw_question()
+        self.root.update_idletasks()
+        self.started_at = time.perf_counter()
+        self.timer_var.set("已用 0.0 秒")
         self._tick_timer(current_generation)
 
     def _tick_timer(self, generation: int) -> None:
-        """每 0.1 秒刷新一次计时标签，不会在 5 秒时强制收走答案。"""
+        """每 0.1 秒显示当前题已经使用的时间，不做快慢判定。"""
 
         if generation != self.timer_generation or self.answered:
             return
         elapsed = time.perf_counter() - self.started_at
-        remaining = 5.0 - elapsed
-        if remaining > 0:
-            self.timer_var.set("剩余 {:.1f} 秒".format(remaining))
-            self.timer_label.configure(fg="#176b48")
-        else:
-            self.timer_var.set("已超时，仍可作答")
-            self.timer_label.configure(fg=self.ACCENT)
+        self.timer_var.set("已用 {:.1f} 秒".format(elapsed))
+        self.timer_label.configure(fg="#176b48")
         self.root.after(100, lambda: self._tick_timer(generation))
 
     def submit_answer(self) -> None:
-        """解析答案、更新两种正确率，并展示牌型解析。"""
+        """解析首次提交、记录完成时间、立即持久化并展示牌型解析。"""
 
-        if self.answered or self.question is None:
+        if self.answered or self.question is None or self.current_session is None:
             return
 
         raw = self.answer_entry.get().strip()
@@ -1294,31 +2141,20 @@ class MahjongTrainerApp:
             self.root.destroy()
             return
 
-        elapsed = time.perf_counter() - self.started_at
+        elapsed = max(0.0, time.perf_counter() - self.started_at)
         parsed = parse_answer(raw, len(self.question.expected))
         is_correct = parsed == self.question.expected
-        is_fast = elapsed <= 5.0
 
-        self.total_answers += 1
+        self.answered = True
+        self.timer_generation += 1
         if is_correct:
-            self.correct_answers += 1
-        if is_correct and is_fast:
-            self.fast_correct_answers += 1
-
-        if is_correct and is_fast:
-            headline = "✓ 答案正确，并在 5 秒内完成"
+            headline = "✓ 答案正确"
             color = "#176b48"
-        elif is_correct:
-            headline = "✓ 答案正确，但用时超过 5 秒"
-            color = "#9a5a00"
         elif parsed is None:
             headline = "✗ 输入格式不正确"
             color = self.ACCENT
-        elif is_fast:
-            headline = "✗ 答案错误"
-            color = self.ACCENT
         else:
-            headline = "✗ 答案错误，且用时超过 5 秒"
+            headline = "✗ 答案错误"
             color = self.ACCENT
 
         self.result_var.set(
@@ -1348,8 +2184,18 @@ class MahjongTrainerApp:
             )
         )
 
-        self.answered = True
-        self.timer_generation += 1
+        self.statistics.record_answer(self.current_session, is_correct, elapsed)
+        try:
+            self.statistics_store.save(self.statistics)
+        except StorageError as exc:
+            self.storage_ready = False
+            self._set_storage_warning(
+                "统计暂未保存，将在下一题完成后重试：{}".format(exc)
+            )
+        else:
+            self.storage_ready = True
+            self._set_storage_warning("")
+
         self.timer_var.set("完成：{:.2f} 秒".format(elapsed))
         self.answer_entry.configure(state="disabled")
         self.submit_button.configure(state="disabled")
@@ -1357,38 +2203,45 @@ class MahjongTrainerApp:
         self.next_button.focus_set()
         self._update_stats_label()
 
-        if self.total_answers % 10 == 0:
-            correct_rate = self.correct_answers * 100.0 / self.total_answers
-            fast_rate = self.fast_correct_answers * 100.0 / self.total_answers
+        if self.current_session.completed % 10 == 0:
+            session_rate = self.current_session.correct * 100.0 / self.current_session.completed
+            history_rate = self.statistics.correct * 100.0 / self.statistics.completed
             messagebox.showinfo(
                 "每 10 题统计",
-                "已完成 {} 题\n\n答案正确：{} 题（{:.1f}%）\n"
-                "5 秒内答对：{} 题（{:.1f}%）".format(
-                    self.total_answers, self.correct_answers, correct_rate,
-                    self.fast_correct_answers, fast_rate
+                "本场已完成 {} 题\n正确率：{:.1f}%\n平均用时：{:.2f} 秒\n\n"
+                "历史累计 {} 题\n正确率：{:.1f}%\n平均用时：{:.2f} 秒".format(
+                    self.current_session.completed,
+                    session_rate,
+                    self.current_session.average_seconds,
+                    self.statistics.completed,
+                    history_rate,
+                    self.statistics.average_seconds,
                 )
             )
 
     def _handle_enter(self, _event: object) -> str:
-        """Enter 在答题前提交，在答题后进入下一题。"""
+        """Enter 在启动页开始训练，在训练页提交或进入下一题。"""
 
-        if self.answered:
+        if self.current_view == "start":
+            self.start_training()
+        elif self.answered:
             self.next_question()
         else:
             self.submit_answer()
         return "break"
 
     def _update_stats_label(self) -> None:
-        """刷新窗口底部的累计统计。"""
+        """刷新训练页底部的本场题数、正确率和平均完成时间。"""
 
-        if self.total_answers == 0:
-            self.stats_var.set("已完成 0 题 ｜ 答案正确率 -- ｜ 5秒内答对率 --")
+        if self.current_session is None or self.current_session.completed == 0:
+            self.stats_var.set("本场 0 题 ｜ 正确率 -- ｜ 平均用时 --")
             return
-        correct_rate = self.correct_answers * 100.0 / self.total_answers
-        fast_rate = self.fast_correct_answers * 100.0 / self.total_answers
+        correct_rate = self.current_session.correct * 100.0 / self.current_session.completed
         self.stats_var.set(
-            "已完成 {} 题 ｜ 答案正确率 {:.1f}% ｜ 5秒内答对率 {:.1f}%".format(
-                self.total_answers, correct_rate, fast_rate
+            "本场 {} 题 ｜ 正确率 {:.1f}% ｜ 平均用时 {:.2f} 秒".format(
+                self.current_session.completed,
+                correct_rate,
+                self.current_session.average_seconds,
             )
         )
 
@@ -1561,7 +2414,7 @@ class MahjongTrainerApp:
 
 
 # ---------------------------------------------------------------------------
-# 六、程序入口
+# 七、程序入口
 # ---------------------------------------------------------------------------
 
 
@@ -1570,7 +2423,7 @@ def print_help() -> None:
 
     print("日麻点数计算训练器")
     print("  直接运行：打开图形训练界面")
-    print("  --self-test：运行点数、牌型、牌图和概率自检")
+    print("  --self-test：运行点数、牌型、牌图、统计存储和概率自检")
 
 
 def main() -> int:
@@ -1586,7 +2439,7 @@ def main() -> int:
         except AssetLoadError as exc:
             print("牌图素材检查失败：{}".format(exc))
             return 1
-        print("全部自检通过：点数表、牌型模板、牌图、宝牌和随机权重均正常。")
+        print("全部自检通过：点数、牌型、牌图、统计存储和随机权重均正常。")
         return 0
 
     # 正常启动时执行快速自检；统计抽样只在 --self-test 中运行。
