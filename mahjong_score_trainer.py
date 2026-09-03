@@ -3,7 +3,7 @@
 
 特点：
 1. 只使用 Python 标准库，不需要安装第三方包；
-2. 使用 tkinter 绘制麻将牌，不依赖外部图片素材；
+2. 使用同一套高清 PNG 麻将牌素材，图形界面仍只依赖 tkinter；
 3. 覆盖 1～13 番、亲家/子家、荣和/自摸；
 4. 每题有 5 秒计时，但超时后仍可继续输入答案；
 5. 每 10 题分别统计答案正确率和 5 秒内答对率。
@@ -24,7 +24,8 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 # tkinter 属于 Python 标准库。某些精简版 Linux Python 可能没有安装 Tk，
@@ -693,6 +694,151 @@ TILE_NAMES: Dict[str, str] = {
     "P": "白", "F": "发", "C": "中",
 }
 
+# 牌图路径始终以脚本所在目录为基准，因此从任意工作目录启动都能找到素材。
+ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets" / "tiles"
+ASSET_SOURCE_SIZE = (600, 800)
+ASSET_SUBSAMPLE = 10
+
+# 内部牌编码与素材文件名的唯一映射。字牌文件名沿用素材项目的日文读音。
+TILE_ASSET_FILES: Dict[str, str] = {
+    **{"{}m".format(rank): "Man{}.png".format(rank) for rank in range(1, 10)},
+    **{"{}p".format(rank): "Pin{}.png".format(rank) for rank in range(1, 10)},
+    **{"{}s".format(rank): "Sou{}.png".format(rank) for rank in range(1, 10)},
+    "E": "Ton.png",
+    "S": "Nan.png",
+    "W": "Shaa.png",
+    "N": "Pei.png",
+    "P": "Haku.png",
+    "F": "Hatsu.png",
+    "C": "Chun.png",
+}
+RED_FIVE_ASSET_FILES: Dict[str, str] = {
+    "5m": "Man5-Dora.png",
+    "5p": "Pin5-Dora.png",
+    "5s": "Sou5-Dora.png",
+}
+REQUIRED_ASSET_FILES: Tuple[str, ...] = tuple(
+    dict.fromkeys(
+        ("Front.png", "Back.png")
+        + tuple(TILE_ASSET_FILES.values())
+        + tuple(RED_FIVE_ASSET_FILES.values())
+    )
+)
+
+
+class AssetLoadError(RuntimeError):
+    """牌图缺失、损坏或规格不一致时抛出的可读错误。"""
+
+
+def read_png_size(path: Path) -> Tuple[int, int]:
+    """仅用标准库读取 PNG 的 IHDR 宽高，不需要解码整张图片。"""
+
+    try:
+        with path.open("rb") as image_file:
+            header = image_file.read(24)
+    except OSError as exc:
+        raise AssetLoadError("无法读取牌图 {}：{}".format(path, exc)) from exc
+
+    if (
+        len(header) != 24
+        or header[:8] != b"\x89PNG\r\n\x1a\n"
+        or header[12:16] != b"IHDR"
+    ):
+        raise AssetLoadError("牌图不是有效 PNG：{}".format(path))
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def validate_asset_files() -> None:
+    """确认运行所需牌图全部存在，而且保持统一的 600×800 规格。"""
+
+    missing = [
+        filename for filename in REQUIRED_ASSET_FILES
+        if not (ASSET_DIRECTORY / filename).is_file()
+    ]
+    if missing:
+        raise AssetLoadError(
+            "缺少牌图素材：{}。请保留完整的 assets/tiles 目录。".format(
+                "、".join(missing)
+            )
+        )
+
+    for filename in REQUIRED_ASSET_FILES:
+        path = ASSET_DIRECTORY / filename
+        actual_size = read_png_size(path)
+        if actual_size != ASSET_SOURCE_SIZE:
+            raise AssetLoadError(
+                "牌图 {} 的尺寸是 {}×{}，要求统一为 {}×{}。".format(
+                    filename, actual_size[0], actual_size[1],
+                    ASSET_SOURCE_SIZE[0], ASSET_SOURCE_SIZE[1]
+                )
+            )
+
+
+def split_display_groups(
+    template: HandTemplate,
+) -> Tuple[Tuple[Tuple[int, TileGroup], ...], Tuple[Tuple[int, TileGroup], ...]]:
+    """把暗手牌和鸣牌分开；保留原索引，以便正确标记和牌张。"""
+
+    concealed = tuple(
+        (index, item) for index, item in enumerate(template.groups)
+        if not item.is_open
+    )
+    called = tuple(
+        (index, item) for index, item in enumerate(template.groups)
+        if item.is_open
+    )
+    return concealed, called
+
+
+class TileImageStore:
+    """一次加载并缓存所有 Tk 牌图，避免每次重绘都读取磁盘。"""
+
+    def __init__(self) -> None:
+        if tk is None:
+            raise AssetLoadError("当前 Python 缺少 tkinter/Tk，无法加载牌图。")
+        validate_asset_files()
+        self._images: Dict[str, object] = {}
+
+        for filename in REQUIRED_ASSET_FILES:
+            path = ASSET_DIRECTORY / filename
+            try:
+                source = tk.PhotoImage(file=str(path))
+                image = source.subsample(ASSET_SUBSAMPLE, ASSET_SUBSAMPLE)
+            except Exception as exc:
+                raise AssetLoadError("Tk 无法加载牌图 {}：{}".format(path, exc)) from exc
+            self._images[filename] = image
+
+    @property
+    def width(self) -> int:
+        """界面中单张牌图的宽度。"""
+
+        return ASSET_SOURCE_SIZE[0] // ASSET_SUBSAMPLE
+
+    @property
+    def height(self) -> int:
+        """界面中单张牌图的高度。"""
+
+        return ASSET_SOURCE_SIZE[1] // ASSET_SUBSAMPLE
+
+    def front(self) -> object:
+        """返回所有明牌共用的牌身底图。"""
+
+        return self._images["Front.png"]
+
+    def back(self) -> object:
+        """返回牌背图。"""
+
+        return self._images["Back.png"]
+
+    def face(self, tile: str, aka: bool = False) -> object:
+        """按内部编码返回普通牌面或赤五牌面。"""
+
+        filename = (
+            RED_FIVE_ASSET_FILES[tile]
+            if aka else TILE_ASSET_FILES[tile]
+        )
+        return self._images[filename]
+
 
 def tile_name(tile: str) -> str:
     """把内部牌编码转换为中文名称。"""
@@ -816,6 +962,10 @@ def validate_template(template: HandTemplate) -> None:
 def run_self_checks(include_frequency_test: bool = False) -> None:
     """运行无需图形界面的内置自检。失败时会抛出 AssertionError。"""
 
+    # 素材检查不创建 Tk 窗口，因此也能在 CI 和无桌面的服务器上执行。
+    validate_asset_files()
+    assert len(REQUIRED_ASSET_FILES) == 39
+
     # 低番荣和关键值，特别检查不能从已进位子家点数乘 1.5 的三格。
     assert CHILD_RON_TABLE[30][3] == 3900
     assert DEALER_RON_TABLE[30][3] == 5800
@@ -835,6 +985,12 @@ def run_self_checks(include_frequency_test: bool = False) -> None:
 
     for template in HAND_TEMPLATES:
         validate_template(template)
+        concealed_groups, called_groups = split_display_groups(template)
+        # 展示顺序必须是全部暗牌在左、全部鸣牌在右，同时保留所有原始组。
+        display_indices = tuple(index for index, _ in concealed_groups + called_groups)
+        assert set(display_indices) == set(range(len(template.groups)))
+        assert all(not item.is_open for _, item in concealed_groups)
+        assert all(item.is_open for _, item in called_groups)
 
     # 所有有效普通组合都必须有模板。
     for win_type in ("ron", "tsumo"):
@@ -878,8 +1034,6 @@ class MahjongTrainerApp:
     TABLE_GREEN = "#0b5d3b"
     PANEL_BG = "#f4f1e8"
     TEXT_DARK = "#17221c"
-    TILE_FACE = "#fffdf4"
-    TILE_EDGE = "#c9c1ae"
     ACCENT = "#c73b32"
 
     def __init__(self, root: object) -> None:
@@ -894,6 +1048,8 @@ class MahjongTrainerApp:
         self.correct_answers = 0
         self.fast_correct_answers = 0
 
+        # PhotoImage 必须在 Tk 根窗口创建之后加载，并要由长生命周期对象持有引用。
+        self.tile_images = TileImageStore()
         self._build_window()
         self.next_question()
 
@@ -902,7 +1058,7 @@ class MahjongTrainerApp:
 
         self.root.title("日麻点数计算训练器")
         self.root.geometry("1120x760")
-        self.root.minsize(980, 700)
+        self.root.minsize(1020, 700)
         self.root.configure(bg=self.PANEL_BG)
 
         header = tk.Frame(self.root, bg="#18392c", padx=22, pady=14)
@@ -918,7 +1074,7 @@ class MahjongTrainerApp:
         tk.Button(
             header, text="退出", command=self.root.destroy,
             bg="#2c5947", fg="white", activebackground="#376c57",
-            activeforeground="white", relief="flat", padx=18, pady=6
+            activeforeground="white", relief="flat", padx=18, pady=10
         ).pack(side="right")
 
         info = tk.Frame(self.root, bg=self.PANEL_BG, padx=24, pady=12)
@@ -936,7 +1092,7 @@ class MahjongTrainerApp:
         self.timer_label.pack(side="right")
 
         self.canvas = tk.Canvas(
-            self.root, height=285, bg=self.TABLE_GREEN,
+            self.root, height=300, bg=self.TABLE_GREEN,
             highlightthickness=0, bd=0
         )
         self.canvas.pack(fill="x", padx=24)
@@ -963,14 +1119,14 @@ class MahjongTrainerApp:
             activeforeground="white", relief="flat", padx=24,
             font=("Microsoft YaHei", 11, "bold")
         )
-        self.submit_button.pack(side="left", padx=(10, 0), ipady=5)
+        self.submit_button.pack(side="left", padx=(10, 0), ipady=9)
         self.next_button = tk.Button(
             input_row, text="下一题", command=self.next_question,
             bg="#345b73", fg="white", activebackground="#29495c",
             activeforeground="white", relief="flat", padx=24,
             font=("Microsoft YaHei", 11, "bold"), state="disabled"
         )
-        self.next_button.pack(side="left", padx=(8, 0), ipady=5)
+        self.next_button.pack(side="left", padx=(8, 0), ipady=9)
 
         self.result_var = tk.StringVar()
         self.result_label = tk.Label(
@@ -1174,27 +1330,40 @@ class MahjongTrainerApp:
             return
         self.canvas.delete("all")
 
-        tile_w, tile_h = 46, 66
-        tile_gap, group_gap = 3, 15
-        group_widths = [
+        tile_w, tile_h = self.tile_images.width, self.tile_images.height
+        tile_gap = 1
+        called_gap = 30
+        called_group_gap = 10
+        concealed_groups, called_groups = split_display_groups(self.question.template)
+
+        concealed_count = sum(len(item.tiles) for _, item in concealed_groups)
+        concealed_width = concealed_count * (tile_w + tile_gap) - tile_gap
+        called_width = sum(
             len(item.tiles) * (tile_w + tile_gap) - tile_gap
-            for item in self.question.template.groups
-        ]
-        total_width = sum(group_widths) + group_gap * (len(group_widths) - 1)
-        canvas_width = max(self.canvas.winfo_width(), 980)
+            for _, item in called_groups
+        )
+        if called_groups:
+            called_width += called_group_gap * (len(called_groups) - 1)
+        total_width = concealed_width
+        if called_groups:
+            total_width += called_gap + called_width
+
+        canvas_width = max(self.canvas.winfo_width(), 972)
         x = max(18, (canvas_width - total_width) / 2)
-        y = 33
+        y = 34
         aka_drawn = False
 
         self.canvas.create_text(
             18, 13, anchor="w", fill="#d8efe2",
-            text="和牌牌型（红框为和牌张）", font=("Microsoft YaHei", 10, "bold")
+            text="和牌牌型（描边与“和”标记为和牌张）",
+            font=("Microsoft YaHei", 10, "bold")
         )
 
-        for group_index, tile_group in enumerate(self.question.template.groups):
+        # 暗牌区完全连续排列，不通过空隙泄露面子和雀头的拆分方式。
+        for group_index, tile_group in concealed_groups:
             for tile_index, tile in enumerate(tile_group.tiles):
                 face_down = (
-                    tile_group.kind == "kan" and not tile_group.is_open
+                    tile_group.kind == "kan"
                     and tile_index in (0, len(tile_group.tiles) - 1)
                 )
                 is_winner = (
@@ -1211,22 +1380,40 @@ class MahjongTrainerApp:
                 self._draw_tile(x, y, tile, tile_w, tile_h, face_down, is_winner, is_aka)
                 x += tile_w + tile_gap
 
-            center_x = x - (group_widths[group_index] + tile_gap) / 2
-            if tile_group.is_open:
-                self.canvas.create_text(
-                    center_x, y + tile_h + 15, text="副露", fill="#d8efe2",
-                    font=("Microsoft YaHei", 8)
-                )
-            elif tile_group.kind == "kan":
-                self.canvas.create_text(
-                    center_x, y + tile_h + 15, text="暗杠", fill="#d8efe2",
-                    font=("Microsoft YaHei", 8)
-                )
-            x += group_gap - tile_gap
+        # 鸣牌与暗牌之间仅保留一个清晰分区间隔，所有鸣牌都排在最右侧。
+        if called_groups:
+            x += called_gap - tile_gap
+            called_start = x
+            for called_index, (group_index, tile_group) in enumerate(called_groups):
+                if called_index:
+                    x += called_group_gap - tile_gap
+                for tile_index, tile in enumerate(tile_group.tiles):
+                    is_winner = (
+                        group_index == self.question.template.win_group
+                        and tile_index == self.question.template.win_index
+                    )
+                    is_aka = False
+                    if not aka_drawn and self.question.bonus.aka_tile == tile:
+                        is_aka = True
+                        aka_drawn = True
+                    self._draw_tile(
+                        x, y, tile, tile_w, tile_h,
+                        False, is_winner, is_aka
+                    )
+                    x += tile_w + tile_gap
+
+            called_end = x - tile_gap
+            self.canvas.create_text(
+                (called_start + called_end) / 2,
+                y + tile_h + 27,
+                text="鸣牌",
+                fill="#d8efe2",
+                font=("Microsoft YaHei", 9, "bold")
+            )
 
         # 宝牌指示牌单独放在下方，确保用户看到的宝牌数量可自行复核。
         dora_x = 30
-        dora_y = 164
+        dora_y = 188
         self.canvas.create_text(
             dora_x, dora_y - 17, anchor="w", fill="#d8efe2",
             text="宝牌指示牌", font=("Microsoft YaHei", 9, "bold")
@@ -1265,145 +1452,40 @@ class MahjongTrainerApp:
         winner: bool,
         aka: bool,
     ) -> None:
-        """绘制一张牌；不同牌种使用文字、圆点或竹节图案。"""
+        """用缓存的统一规格 PNG 绘制牌身、牌面及非纯颜色的和牌标记。"""
 
-        edge = "#ff8a75" if winner else self.TILE_EDGE
-        edge_width = 3 if winner else 1
+        # 轻微阴影让相邻牌仍有边界，但不会形成面子之间的视觉分组。
         self.canvas.create_rectangle(
-            x + 3, y + 4, x + width + 3, y + height + 4,
+            x + 2, y + 3, x + width + 2, y + height + 3,
             fill="#073e29", outline=""
-        )
-        self.canvas.create_rectangle(
-            x, y, x + width, y + height,
-            fill="#285f89" if face_down else self.TILE_FACE,
-            outline=edge, width=edge_width
         )
 
         if face_down:
-            self.canvas.create_rectangle(
-                x + 6, y + 7, x + width - 6, y + height - 7,
-                outline="#8fc0df", width=2
+            self.canvas.create_image(
+                x, y, anchor="nw", image=self.tile_images.back()
             )
-            for offset in range(11, height - 8, 10):
-                self.canvas.create_line(
-                    x + 8, y + offset, x + width - 8, y + offset,
-                    fill="#4f86ac"
-                )
-            return
-
-        if len(tile) == 2:
-            rank = int(tile[0])
-            suit = tile[1]
-            if suit == "m":
-                chinese_digits = "一二三四五六七八九"
-                number_color = "#d33a31" if aka else "#1f2b35"
-                self.canvas.create_text(
-                    x + width / 2, y + 22, text=chinese_digits[rank - 1],
-                    fill=number_color, font=("Microsoft YaHei", 17, "bold")
-                )
-                self.canvas.create_text(
-                    x + width / 2, y + 49, text="萬", fill="#c4312b",
-                    font=("Microsoft YaHei", 17, "bold")
-                )
-            elif suit == "p":
-                self._draw_pinzu(x, y, width, height, rank, aka)
-            else:
-                self._draw_souzu(x, y, width, height, rank, aka)
         else:
-            honor_text = TILE_NAMES[tile]
-            honor_color = {
-                "C": "#d7332f", "F": "#16824f", "P": "#356d96"
-            }.get(tile, "#242f38")
-            if tile == "P":
-                self.canvas.create_rectangle(
-                    x + 10, y + 12, x + width - 10, y + height - 12,
-                    outline=honor_color, width=2
-                )
-            else:
-                self.canvas.create_text(
-                    x + width / 2, y + height / 2, text=honor_text,
-                    fill=honor_color, font=("Microsoft YaHei", 22, "bold")
-                )
+            # 原素材把共用牌身和透明牌面分开导出，因此需要按顺序叠放两层。
+            self.canvas.create_image(
+                x, y, anchor="nw", image=self.tile_images.front()
+            )
+            self.canvas.create_image(
+                x, y, anchor="nw", image=self.tile_images.face(tile, aka)
+            )
 
         if aka:
             self.canvas.create_text(
-                x + width - 3, y + 3, anchor="ne", text="赤",
-                fill="#d7332f", font=("Microsoft YaHei", 7, "bold")
+                x + width - 4, y + 4, anchor="ne", text="赤",
+                fill="#a91f1a", font=("Microsoft YaHei", 7, "bold")
             )
         if winner:
+            self.canvas.create_rectangle(
+                x - 2, y - 2, x + width + 2, y + height + 2,
+                outline="#ff9a86", width=3
+            )
             self.canvas.create_text(
-                x + width / 2, y + height + 8, text="和",
-                fill="#ffd0c8", font=("Microsoft YaHei", 8, "bold")
-            )
-
-    @staticmethod
-    def _pip_positions(rank: int) -> List[Tuple[float, float]]:
-        """返回筒子和索子共用的归一化点阵坐标。"""
-
-        layouts: Dict[int, List[Tuple[float, float]]] = {
-            1: [(0.50, 0.50)],
-            2: [(0.30, 0.28), (0.70, 0.72)],
-            3: [(0.28, 0.25), (0.50, 0.50), (0.72, 0.75)],
-            4: [(0.30, 0.28), (0.70, 0.28), (0.30, 0.72), (0.70, 0.72)],
-            5: [(0.30, 0.25), (0.70, 0.25), (0.50, 0.50), (0.30, 0.75), (0.70, 0.75)],
-            6: [(0.30, 0.20), (0.70, 0.20), (0.30, 0.50), (0.70, 0.50), (0.30, 0.80), (0.70, 0.80)],
-            7: [(0.28, 0.18), (0.72, 0.18), (0.50, 0.38), (0.28, 0.58), (0.72, 0.58), (0.28, 0.82), (0.72, 0.82)],
-            8: [(0.30, 0.16), (0.70, 0.16), (0.30, 0.39), (0.70, 0.39), (0.30, 0.62), (0.70, 0.62), (0.30, 0.85), (0.70, 0.85)],
-            9: [(0.25, 0.18), (0.50, 0.18), (0.75, 0.18), (0.25, 0.50), (0.50, 0.50), (0.75, 0.50), (0.25, 0.82), (0.50, 0.82), (0.75, 0.82)],
-        }
-        return layouts[rank]
-
-    def _draw_pinzu(self, x: float, y: float, width: int, height: int, rank: int, aka: bool) -> None:
-        """用彩色圆点绘制筒子。"""
-
-        positions = self._pip_positions(rank)
-        radius = 5 if rank <= 4 else 4
-        colors = ("#d13932", "#2475a8", "#16824f")
-        for index, (px, py) in enumerate(positions):
-            color = "#d13932" if aka else colors[index % len(colors)]
-            cx = x + px * width
-            cy = y + py * height
-            self.canvas.create_oval(
-                cx - radius, cy - radius, cx + radius, cy + radius,
-                outline=color, width=2
-            )
-            if rank == 1:
-                self.canvas.create_oval(
-                    cx - radius / 2, cy - radius / 2,
-                    cx + radius / 2, cy + radius / 2,
-                    fill=color, outline=""
-                )
-
-    def _draw_souzu(self, x: float, y: float, width: int, height: int, rank: int, aka: bool) -> None:
-        """用短竹节绘制索子，避免依赖特殊麻将字体。"""
-
-        if rank == 1:
-            color = "#d13932" if aka else "#16824f"
-            self.canvas.create_oval(
-                x + 13, y + 17, x + width - 13, y + 43,
-                outline=color, width=3
-            )
-            self.canvas.create_line(
-                x + width / 2, y + 15, x + width / 2 - 9, y + 52,
-                fill="#2475a8", width=3
-            )
-            self.canvas.create_line(
-                x + width / 2, y + 15, x + width / 2 + 9, y + 52,
-                fill=color, width=3
-            )
-            return
-
-        positions = self._pip_positions(rank)
-        colors = ("#16824f", "#2475a8", "#16824f")
-        for index, (px, py) in enumerate(positions):
-            color = "#d13932" if aka else colors[index % len(colors)]
-            cx = x + px * width
-            cy = y + py * height
-            self.canvas.create_line(
-                cx, cy - 5, cx, cy + 5, fill=color, width=3
-            )
-            self.canvas.create_line(
-                cx - 3, cy, cx + 3, cy, fill="#c7a437", width=1
+                x + width / 2, y + height + 11, text="和",
+                fill="#ffe0d9", font=("Microsoft YaHei", 9, "bold")
             )
 
 
@@ -1417,7 +1499,7 @@ def print_help() -> None:
 
     print("日麻点数计算训练器")
     print("  直接运行：打开图形训练界面")
-    print("  --self-test：运行点数、牌型和概率自检")
+    print("  --self-test：运行点数、牌型、牌图和概率自检")
 
 
 def main() -> int:
@@ -1428,12 +1510,20 @@ def main() -> int:
         return 0
 
     if "--self-test" in sys.argv:
-        run_self_checks(include_frequency_test=True)
-        print("全部自检通过：点数表、牌型模板、宝牌和随机权重均正常。")
+        try:
+            run_self_checks(include_frequency_test=True)
+        except AssetLoadError as exc:
+            print("牌图素材检查失败：{}".format(exc))
+            return 1
+        print("全部自检通过：点数表、牌型模板、牌图、宝牌和随机权重均正常。")
         return 0
 
     # 正常启动时执行快速自检；统计抽样只在 --self-test 中运行。
-    run_self_checks(include_frequency_test=False)
+    try:
+        run_self_checks(include_frequency_test=False)
+    except AssetLoadError as exc:
+        print("牌图素材检查失败：{}".format(exc))
+        return 1
 
     if tk is None:
         print("无法启动图形界面：当前 Python 缺少 tkinter/Tk 支持。")
@@ -1449,7 +1539,15 @@ def main() -> int:
         print("请在带桌面环境的终端中运行本程序。")
         return 1
 
-    MahjongTrainerApp(root)
+    try:
+        MahjongTrainerApp(root)
+    except AssetLoadError as exc:
+        message = "牌图素材加载失败：{}".format(exc)
+        print(message)
+        if messagebox is not None:
+            messagebox.showerror("无法加载牌图", message)
+        root.destroy()
+        return 1
     root.mainloop()
     return 0
 
